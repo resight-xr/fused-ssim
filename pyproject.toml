@@ -1,0 +1,10 @@
+[project]
+name = "fused-ssim"
+version = "0.0.1"
+dependencies = [
+  "torch",
+]
+
+[build-system]
+requires = ["setuptools", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
