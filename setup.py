@@ -1,11 +1,11 @@
-from setuptools import setup
-from torch.utils.cpp_extension import CUDAExtension, BuildExtension
-import torch
-import sys
 import os
+import sys
+
+from setuptools import setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 # Force unbuffered output
-os.environ['PYTHONUNBUFFERED'] = '1'
+os.environ["PYTHONUNBUFFERED"] = "1"
 sys.stderr.reconfigure(line_buffering=True)
 
 
@@ -22,59 +22,44 @@ nvcc_args = [
     "--use_fast_math",
 ]
 
-detected_arch = None
 
-if torch.cuda.is_available():
-    try:
-        device = torch.cuda.current_device()
-        compute_capability = torch.cuda.get_device_capability(device)
-        arch = f"sm_{compute_capability[0]}{compute_capability[1]}"
-        
-        # Print to multiple outputs
-        arch_msg = f"Detected GPU architecture: {arch}"
-        print(arch_msg)
-        print(arch_msg, file=sys.stderr, flush=True)
-        
-        nvcc_args.append(f"-arch={arch}")
-        detected_arch = arch
-    except Exception as e:
-        error_msg = f"Failed to detect GPU architecture: {e}. Falling back to multiple architectures."
-        print(error_msg)
-        print(error_msg, file=sys.stderr, flush=True)
+arch_list = os.getenv("TORCH_CUDA_ARCH_LIST")
+
+
+if CUDA_HOME and os.path.exists(os.path.join(CUDA_HOME, "bin", "nvcc")):
+    if arch_list:
+        # Let NVCC expand from TORCH_CUDA_ARCH_LIST at link time; or explicitly map to -gencode list.
+        pass
+    else:
+        # Explicit multi-arch fallback (same as your current list)
         nvcc_args.extend(fallback_archs)
 else:
-    cuda_msg = "CUDA not available. Falling back to multiple architectures."
-    print(cuda_msg)
-    print(cuda_msg, file=sys.stderr, flush=True)
-    nvcc_args.extend(fallback_archs)
+    raise RuntimeError(
+        "CUDA toolchain not found; set CUDA_HOME or use the CUDA devel image."
+    )
+
 
 # Create a custom class that prints the architecture information
 class CustomBuildExtension(BuildExtension):
     def build_extensions(self):
-        arch_info = f"Building with GPU architecture: {detected_arch if detected_arch else 'multiple architectures'}"
-        print("\n" + "="*50)
+        arch_info = f"Building with GPU architecture: {arch_list if arch_list else 'multiple architectures'}"
+        print("\n" + "=" * 50)
         print(arch_info)
-        print("="*50 + "\n")
+        print("=" * 50 + "\n")
         super().build_extensions()
+
 
 setup(
     name="fused_ssim",
-    packages=['fused_ssim'],
+    packages=["fused_ssim"],
     ext_modules=[
         CUDAExtension(
             name="fused_ssim_cuda",
-            sources=[
-                "ssim.cu",
-                "ext.cpp"],
-            extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": nvcc_args
-            }
+            sources=["ssim.cu", "ext.cpp"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": nvcc_args},
         )
     ],
-    cmdclass={
-        'build_ext': CustomBuildExtension
-    }
+    cmdclass={"build_ext": CustomBuildExtension},
 )
 
 # Print again at the end of setup.py execution

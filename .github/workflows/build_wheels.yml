@@ -1,0 +1,115 @@
+name: Build CUDA wheels with uv (fused_ssim)
+
+on:
+  push:
+    tags: [ "v*" ]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build wheels (py${{ matrix.py }})
+    runs-on: ubuntu-24.04
+
+    # Use a CUDA devel image so nvcc & headers are available
+    container:
+      image: nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        py: [ "3.10", "3.11", "3.12"]
+
+    env:
+      # Change to match what you want to target
+      TORCH_CUDA_ARCH_LIST: "8.6;8.9;9.0"
+      FORCE_CUDA: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OS deps (python3, pip, toolchain)
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            python3 python3-venv python3-pip \
+            git build-essential \
+            patchelf curl ca-certificates
+          ln -sf /usr/bin/python3 /usr/local/bin/python
+          python3 -V
+          nvcc --version
+
+      - name: Install uv (system python)
+        run: |
+          python3 -m pip install -U uv
+          # make sure uv’s local installs are reachable if needed
+          echo 'export PATH="$HOME/.local/bin:$PATH"' >> $GITHUB_ENV
+
+      - name: Install CPython ${{ matrix.py }} via uv
+        run: |
+          python3 -m uv python install ${{ matrix.py }}
+
+      - name: Create venv (py${{ matrix.py }}) with uv
+        run: |
+          python3 -m uv venv --python ${{ matrix.py }} .venv-${{ matrix.py }}
+          ./.venv-${{ matrix.py }}/bin/python -V
+
+      - name: Install build deps into venv using uv (no system pip needed)
+        run: |
+          # Install/upgrade pip into the venv (works even if pip isn't there yet)
+          python3 -m uv pip install -p .venv-${{ matrix.py }} --upgrade pip
+          # Core build deps
+          python3 -m uv pip install -p .venv-${{ matrix.py }} wheel setuptools build numpy ninja packaging
+          # CUDA-enabled PyTorch (cu121)
+          python3 -m uv pip install -p .venv-${{ matrix.py }} --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
+          # Sanity print
+          ./.venv-${{ matrix.py }}/bin/python - << 'PY'
+          import sys, torch
+          print("Python:", sys.version.split()[0])
+          print("Torch:", torch.__version__)
+          print("Torch CUDA (build):", torch.version.cuda)
+          PY
+
+      - name: Build wheel (no isolation; uses this venv so tags match)
+        run: |
+          mkdir -p dist/py${{ matrix.py }}
+          ./.venv-${{ matrix.py }}/bin/python -m build --wheel --no-isolation --outdir dist/py${{ matrix.py }}
+          ls -al dist/py${{ matrix.py }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-py${{ matrix.py }}
+          path: dist/py${{ matrix.py }}/*.whl
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # flatten multiple artifacts into a single folder
+          merge-multiple: true
+          path: wheels
+
+      - name: List wheels
+        run: |
+          echo "Downloaded wheels:"
+          find wheels -type f -name '*.whl' -print
+          # hard fail if nothing was downloaded
+          test -n "$(find wheels -type f -name '*.whl' -print -quit)" || { echo "No wheels found in artifacts"; exit 1; }
+
+      - name: Upload wheels to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wheels/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
