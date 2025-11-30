@@ -2,7 +2,8 @@ name: Build CUDA wheels with uv (fused_ssim)
 
 on:
   push:
-    tags: [ "v*" ]
+    branches: [ "main" ]
+    tags: [ "v*", "latest" ]
   pull_request:
 
 permissions:
@@ -15,7 +16,8 @@ jobs:
 
     # Use a CUDA devel image so nvcc & headers are available
     container:
-      image: nvidia/cuda:12.1.1-devel-ubuntu22.04
+      # Smaller base image; install only the CUDA bits we need below
+      image: nvidia/cuda:12.1.1-base-ubuntu22.04
 
     strategy:
       fail-fast: false
@@ -43,10 +45,12 @@ jobs:
       - name: Install OS deps (python3, pip, toolchain)
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            python3 python3-venv python3-pip \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 python3-venv python3-pip python3-dev \
             git build-essential \
-            patchelf curl ca-certificates
+            patchelf curl ca-certificates \
+            cuda-compiler-12-1 cuda-cudart-dev-12-1
+          rm -rf /var/lib/apt/lists/*
           ln -sf /usr/bin/python3 /usr/local/bin/python
           python3 -V
           nvcc --version
