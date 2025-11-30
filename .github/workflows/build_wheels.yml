@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build wheels (py${{ matrix.py }})
+    name: Build wheels (py${{ matrix.py }} torch${{ matrix.torch.cuda }})
     runs-on: ubuntu-24.04
 
     # Use a CUDA devel image so nvcc & headers are available
@@ -21,6 +21,13 @@ jobs:
       fail-fast: false
       matrix:
         py: [ "3.10", "3.11", "3.12"]
+        torch:
+          - version: "2.5.1+cu121"
+            index: "https://download.pytorch.org/whl/cu121"
+            cuda: "cu121"
+          - version: "2.8.0+cu128"
+            index: "https://download.pytorch.org/whl/cu128"
+            cuda: "cu128"
 
     env:
       # Change to match what you want to target
@@ -65,8 +72,8 @@ jobs:
           python3 -m uv pip install -p .venv-${{ matrix.py }} --upgrade pip
           # Core build deps
           python3 -m uv pip install -p .venv-${{ matrix.py }} wheel setuptools build numpy ninja packaging
-          # CUDA-enabled PyTorch (cu121)
-          python3 -m uv pip install -p .venv-${{ matrix.py }} --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
+          # CUDA-enabled PyTorch
+          python3 -m uv pip install -p .venv-${{ matrix.py }} --index-url ${{ matrix.torch.index }} "torch==${{ matrix.torch.version }}"
           # Sanity print
           ./.venv-${{ matrix.py }}/bin/python - << 'PY'
           import sys, torch
@@ -77,15 +84,15 @@ jobs:
 
       - name: Build wheel (no isolation; uses this venv so tags match)
         run: |
-          mkdir -p dist/py${{ matrix.py }}
-          ./.venv-${{ matrix.py }}/bin/python -m build --wheel --no-isolation --outdir dist/py${{ matrix.py }}
-          ls -al dist/py${{ matrix.py }}
+          mkdir -p dist/py${{ matrix.py }}/${{ matrix.torch.cuda }}
+          ./.venv-${{ matrix.py }}/bin/python -m build --wheel --no-isolation --outdir dist/py${{ matrix.py }}/${{ matrix.torch.cuda }}
+          ls -al dist/py${{ matrix.py }}/${{ matrix.torch.cuda }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-py${{ matrix.py }}
-          path: dist/py${{ matrix.py }}/*.whl
+          name: wheels-py${{ matrix.py }}-${{ matrix.torch.cuda }}
+          path: dist/py${{ matrix.py }}/${{ matrix.torch.cuda }}/*.whl
           if-no-files-found: error
 
   release:

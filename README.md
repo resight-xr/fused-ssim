@@ -13,24 +13,26 @@ As per the original SSIM paper, this implementation uses `11x11` sized convoluti
 
 ### Option 1: Prebuilt CUDA Wheels (Recommended)
 
-We publish Linux x86_64 wheels built against **PyTorch CUDA 12.1** (`+cu121`) for common Python versions. These wheels contain the compiled CUDA extension, so you don't need a local CUDA toolkit or a C++ toolchain to use them.
+We publish Linux x86_64 wheels built against **PyTorch CUDA 12.1** (`+cu121`) and **CUDA 12.8** (`+cu128`) for common Python versions. These wheels contain the compiled CUDA extension, so you don't need a local CUDA toolkit or a C++ toolchain to use them.
 
 **Requirements**
 - Linux x86_64
-- Python **3.10** or **3.11**
-- PyTorch **2.5.1+cu121** (installed from the PyTorch CUDA 12.1 wheel index)
+- Python **3.10**, **3.11**, or **3.12**
+- PyTorch either **2.5.1+cu121** (from the CUDA 12.1 index) **or** **2.8.0+cu128** (from the CUDA 12.8 index)
 
 Architectures compiled: `sm_86; sm_89; sm_90` (Ampere / Ada / Hopper).
 
 #### Using uv (recommended)
 
 ```bash
-# 1) Install matching CUDA-enabled PyTorch (cu121)
+# 1) Install matching CUDA-enabled PyTorch (pick one)
 uv pip install --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
+# or
+uv pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0+cu128"
 
 # 2) Install the prebuilt fused-ssim wheel
-# (Pick the wheel matching your Python, e.g. cp311 for Python 3.11)
-uv pip install "https://github.com/resight-xr/fused-ssim/releases/download/v0.0.2/fused_ssim-0.0.2-cp311-cp311-linux_x86_64.whl"
+# (Pick the wheel matching your Python and CUDA flavor, e.g. cp311 + cu121)
+uv pip install "https://github.com/resight-xr/fused-ssim/releases/download/v0.0.3/fused_ssim-0.0.3-cp311-cp311-linux_x86_64.whl"
 
 # Sanity check
 python - <<'PY'
@@ -39,13 +41,15 @@ print("fused_ssim OK; torch:", torch.__version__, "CUDA:", torch.version.cuda)
 PY
 ```
 
-> For Python **3.10**, change `cp311-cp311` → `cp310-cp310` in the wheel filename.
+> Adjust the wheel tag to match your Python (`cp310`, `cp311`, `cp312`), and download the cu121 or cu128 wheel from the release assets to match the torch you installed.
 
 #### Using pip
 
 ```bash
 python -m pip install --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
-python -m pip install "https://github.com/resight-xr/fused-ssim/releases/download/v0.0.2/fused_ssim-0.0.2-cp311-cp311-linux_x86_64.whl"
+# or
+python -m pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0+cu128"
+python -m pip install "https://github.com/resight-xr/fused-ssim/releases/download/v0.0.3/fused_ssim-0.0.3-cp311-cp311-linux_x86_64.whl"
 ```
 
 #### Wheel filenames
@@ -56,6 +60,7 @@ Pick the wheel that matches your **Python**:
 |-------:|--------------------|
 |  3.10  | `cp310-cp310`      |
 |  3.11  | `cp311-cp311`      |
+|  3.12  | `cp312-cp312`      |
 
 ### Option 2: Build from Source
 
@@ -90,18 +95,22 @@ pip install .
 ### Troubleshooting
 
 - **`RuntimeError: CUDA error` or `No CUDA GPUs are available`**  
-  Ensure your system has a compatible NVIDIA driver and that your runtime environment can access it. The wheel relies on the **PyTorch CUDA runtime**; no separate CUDA install is required, but the driver must be new enough for **CUDA 12.1**.
+  Ensure your system has a compatible NVIDIA driver and that your runtime environment can access it. The wheel relies on the **PyTorch CUDA runtime**; no separate CUDA install is required, but the driver must be new enough for the CUDA flavor you installed (**12.1** or **12.8**).
 
-- **`torch.version.cuda` doesn't say 12.1**  
-  Reinstall PyTorch from the CUDA 12.1 index:
+- **`torch.version.cuda` doesn't match (12.1 vs 12.8)**  
+  Reinstall PyTorch from the matching CUDA index:
   ```bash
   uv pip install --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121" --upgrade
+  # or
+  uv pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0+cu128" --upgrade
   ```
 
 - **Different Python version**  
-  Use the wheel matching your Python (`cp310` vs `cp311`). If you don't see a matching wheel, you can still build from source:
+  Use the wheel matching your Python (`cp310`, `cp311`, `cp312`). If you don't see a matching wheel, you can still build from source:
   ```bash
   uv pip install --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
+  # or
+  uv pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0+cu128"
   uv pip install numpy ninja packaging
   uv pip install -e .
   ```
