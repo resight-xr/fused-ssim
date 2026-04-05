@@ -75,21 +75,10 @@ jobs:
       - name: Build wheel
         run: |
           mkdir -p dist
+          # Inject +cu128 into version so both METADATA and filename match
+          sed -i 's/^version = "\([^"]*\)"/version = "\1+cu128"/' pyproject.toml
+          grep '^version' pyproject.toml
           ./.venv/bin/python -m build --wheel --no-isolation --outdir dist
-          # Encode CUDA flavor into the wheel filename
-          python3 - << 'PY'
-          from pathlib import Path
-          import re, sys
-          cuda = "cu128"
-          for wheel in Path("dist").glob("*.whl"):
-              m = re.match(r"^(?P<name>[^-]+)-(?P<version>[^-]+)-(?P<rest>.+)$", wheel.name)
-              if not m:
-                  print(f"Skipping: {wheel.name}", file=sys.stderr)
-                  continue
-              new_name = f"{m.group('name')}-{m.group('version')}+{cuda}-{m.group('rest')}"
-              wheel.rename(wheel.with_name(new_name))
-              print(f"{wheel.name} -> {new_name}")
-          PY
           ls -lh dist/
 
       - name: Upload wheel artifact
