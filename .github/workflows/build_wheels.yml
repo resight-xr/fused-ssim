@@ -1,0 +1,154 @@
+name: Build CUDA wheels (fused_ssim)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build wheel (py${{ matrix.py }}-${{ matrix.torch.cuda }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        py: ["3.11"]
+        torch:
+          - version: "2.8.0+cu128"
+            index: "https://download.pytorch.org/whl/cu128"
+            cuda: "cu128"
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            cuda_arch_list: "8.0;8.6;8.7;8.9;9.0"
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            cuda_arch_list: "8.7;8.9;9.0"
+
+    env:
+      CUDA_ARCHITECTURES: ${{ matrix.cuda_arch_list }}
+      TORCH_CUDA_ARCH_LIST: ${{ matrix.cuda_arch_list }}
+      FORCE_CUDA: "1"
+      DEBIAN_FRONTEND: noninteractive
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_CACHE_DIR: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OS deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            python3 python3-venv python3-pip python3-dev \
+            git build-essential patchelf curl ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          ln -sf /usr/bin/python3 /usr/local/bin/python
+          python3 -V
+          nvcc --version
+
+      - name: Install uv
+        run: |
+          python3 -m pip install -U uv
+          echo 'export PATH="$HOME/.local/bin:$PATH"' >> $GITHUB_ENV
+
+      - name: Install CPython ${{ matrix.py }} via uv
+        run: uv python install ${{ matrix.py }}
+
+      - name: Create venv and install deps
+        run: |
+          uv venv --python ${{ matrix.py }} .venv
+          uv pip install -p .venv --upgrade pip
+          uv pip install -p .venv wheel setuptools build numpy ninja packaging
+          uv pip install -p .venv --index-url ${{ matrix.torch.index }} "torch==${{ matrix.torch.version }}"
+          ./.venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
+
+      - name: Build wheel
+        run: |
+          mkdir -p dist
+          ./.venv/bin/python -m build --wheel --no-isolation --outdir dist
+          # Encode CUDA flavor into the wheel filename
+          python3 - << 'PY'
+          from pathlib import Path
+          import re, sys
+          cuda = "${{ matrix.torch.cuda }}"
+          for wheel in Path("dist").glob("*.whl"):
+              m = re.match(r"^(?P<name>[^-]+)-(?P<version>[^-]+)-(?P<rest>.+)$", wheel.name)
+              if not m:
+                  print(f"Skipping: {wheel.name}", file=sys.stderr)
+                  continue
+              new_name = f"{m.group('name')}-{m.group('version')}+{cuda}-{m.group('rest')}"
+              wheel.rename(wheel.with_name(new_name))
+              print(f"{wheel.name} -> {new_name}")
+          PY
+          ls -lh dist/
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.py }}-${{ matrix.torch.cuda }}-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    needs: [build]
+    steps:
+      - name: Checkout
+        if: github.ref == 'refs/heads/main'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare release tag
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "RELEASE_TAG=latest" >> $GITHUB_ENV
+            echo "RELEASE_NAME=latest (main)" >> $GITHUB_ENV
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "RELEASE_TAG=$tag" >> $GITHUB_ENV
+            echo "RELEASE_NAME=$tag" >> $GITHUB_ENV
+          fi
+
+      - name: Move latest tag (main only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${GITHUB_SHA}"
+          git push -f origin latest
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: wheels
+
+      - name: List wheels
+        run: |
+          echo "Downloaded wheels:"
+          find wheels -type f -name '*.whl' -print
+          test -n "$(find wheels -type f -name '*.whl' -print -quit)" || { echo "No wheels found"; exit 1; }
+
+      - name: Upload wheels to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          files: wheels/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
