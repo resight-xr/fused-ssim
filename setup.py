@@ -39,10 +39,14 @@ def configure_cuda():
 
         if cuda_archs_env:
             try:
-                archs = [arch.strip() for arch in cuda_archs_env.split(';')]
+                archs = [arch.strip() for arch in cuda_archs_env.split(';') if arch.strip()]
                 log(f"Using CUDA architectures from environment: {archs}")
                 for arch in archs:
-                    compiler_args["nvcc"].append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
+                    emit_ptx = arch.endswith("+PTX")
+                    sm = arch[:-4] if emit_ptx else arch
+                    compiler_args["nvcc"].append(f"-gencode=arch=compute_{sm},code=sm_{sm}")
+                    if emit_ptx:
+                        compiler_args["nvcc"].append(f"-gencode=arch=compute_{sm},code=compute_{sm}")
                 detected_arch = f"env:{','.join(archs)}"
                 arch_configured = True
             except Exception as e:
