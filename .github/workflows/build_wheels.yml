@@ -32,6 +32,7 @@ jobs:
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
             py_tag: "cp311"
+            torch_index_url: "https://download.pytorch.org/whl/cu128"
           - arch: arm64
             runner: ubuntu-24.04-arm
             torch_version: "2.9.0+cu128"
@@ -39,6 +40,7 @@ jobs:
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
             py_tag: "cp311"
+            torch_index_url: "https://download.pytorch.org/whl/cu128"
           # PHASE-C: Verify nvidia/cuda:12.6.3-devel-ubuntu24.04 exists on
           # Docker Hub before this row runs in CI.  At authoring time the tag
           # was chosen to match pytorch-jetson's LSB_RELEASE=24.04 and
@@ -105,6 +107,9 @@ jobs:
         # Contents:read + Metadata:read) for an account that has read access to
         # the PRIVATE resight-xr/pytorch-jetson repository.
         # Without it, `gh release download` will fail with 404 / auth error.
+        # GH_TOKEN resolves to an empty string on cu128 rows (the secret is only
+        # needed for jp62); this is intentional and harmless because `gh` is
+        # only invoked inside the `if [[ wheel_tag == jp62 ]]` branch below.
         env:
           GH_TOKEN: ${{ secrets.PYTORCH_JETSON_READ_TOKEN }}
         run: |
@@ -114,13 +119,25 @@ jobs:
           if [[ "${{ matrix.wheel_tag }}" == "jp62" ]]; then
             # Jetson wheels come from the private pytorch-jetson release, not PyPI.
             # Private-repo download requires gh CLI + GH_TOKEN (PYTORCH_JETSON_READ_TOKEN).
+            # PHASE-C: `latest` is a mutable release tag — if the torch version
+            # published under `latest` diverges from matrix.torch_version, the
+            # --pattern below will match nothing and the zero-match guard below
+            # will surface the mismatch.  Once torch versions stabilise, pin
+            # this to a versioned release tag (e.g. `v2.9.1-jp62`) instead.
             gh release download latest \
               --repo resight-xr/pytorch-jetson \
               --pattern "torch-${{ matrix.torch_version }}-${{ matrix.py_tag }}-${{ matrix.py_tag }}-linux_aarch64.whl" \
               --dir /tmp/jetson-torch
+            # Guard: if the pattern matched nothing, gh exits 0 silently — catch that here.
+            ls /tmp/jetson-torch/torch-*.whl >/dev/null 2>&1 || {
+              echo "ERROR: gh release download matched no assets for pattern torch-${{ matrix.torch_version }}-${{ matrix.py_tag }}-${{ matrix.py_tag }}-linux_aarch64.whl"
+              echo "Listing /tmp/jetson-torch:"
+              ls -la /tmp/jetson-torch/ 2>&1 || echo "(directory does not exist)"
+              exit 1
+            }
             uv pip install -p .venv /tmp/jetson-torch/torch-*.whl
           else
-            uv pip install -p .venv --index-url https://download.pytorch.org/whl/cu128 "torch==${{ matrix.torch_version }}"
+            uv pip install -p .venv --index-url ${{ matrix.torch_index_url }} "torch==${{ matrix.torch_version }}"
           fi
           ./.venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
 
@@ -136,14 +153,16 @@ jobs:
           ./.venv/bin/python -m build --wheel --no-isolation --outdir dist
           ls -lh dist/
 
-      # PHASE-C: Verify wheel imports correctly inside the build container.
-      # This catches CUDA linkage issues (missing symbols, wrong libcudart, etc.)
-      # that would only surface at import time, not at build time.
+      # PHASE-C: Watch this step on first CI run — it surfaces CUDA linkage
+      # failures (missing symbols, wrong libcudart) that only appear at import.
       - name: Verify wheel imports
         run: |
           uv pip install -p .venv dist/*.whl --no-deps
           ./.venv/bin/python -c "import fused_ssim; print('fused_ssim import OK')"
 
+      # Artifact names are unique via the (wheel_tag, arch) combination.
+      # `arch: arm64-jetson` is load-bearing here — it distinguishes the jp62
+      # artifact from the plain arm64/cu128 artifact, not just a cosmetic label.
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
