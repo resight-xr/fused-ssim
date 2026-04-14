@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   build:
-    name: Build wheel (py${{ matrix.py }}-cu128-${{ matrix.arch }})
+    name: Build wheel (py${{ matrix.py }}-${{ matrix.wheel_tag }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
     container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+      image: ${{ matrix.cuda_container }}
 
     strategy:
       fail-fast: false
@@ -29,10 +29,25 @@ jobs:
             runner: ubuntu-24.04
             torch_version: "2.8.0+cu128"
             cuda_architectures: "80;86;87;89;90;100;120+PTX"
+            cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
+            wheel_tag: "cu128"
           - arch: arm64
             runner: ubuntu-24.04-arm
             torch_version: "2.9.0+cu128"
             cuda_architectures: "87;89;90"
+            cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
+            wheel_tag: "cu128"
+          # PHASE-C: Verify nvidia/cuda:12.6.3-devel-ubuntu24.04 exists on
+          # Docker Hub before this row runs in CI.  At authoring time the tag
+          # was chosen to match pytorch-jetson's LSB_RELEASE=24.04 and
+          # CUDA 12.6 build environment.  If the exact tag is absent, pick
+          # the closest available 12.6.x-devel-ubuntu24.04 tag.
+          - arch: arm64-jetson
+            runner: ubuntu-24.04-arm
+            torch_version: "2.9.1+jp62"
+            cuda_architectures: "87"
+            cuda_container: "nvidia/cuda:12.6.3-devel-ubuntu24.04"
+            wheel_tag: "jp62"
 
     env:
       CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
@@ -56,6 +71,21 @@ jobs:
           python3 -V
           nvcc --version
 
+      # Install the GitHub CLI so the jp62 row can download the private
+      # pytorch-jetson wheel via `gh release download`.  We install it
+      # universally (it is a small binary) rather than conditionally to
+      # avoid extra YAML complexity; on the cu128 rows it is simply unused.
+      - name: Install gh CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+            https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
+          rm -rf /var/lib/apt/lists/*
+
       - name: Install uv
         run: |
           python3 -m pip install -U uv
@@ -65,26 +95,56 @@ jobs:
         run: uv python install ${{ matrix.py }}
 
       - name: Create venv and install deps
+        # PHASE-C: The jp62 branch requires the secret PYTORCH_JETSON_READ_TOKEN
+        # to be created in the fused-ssim repo settings
+        # (Settings → Secrets and variables → Actions → New repository secret).
+        # The secret must hold a Classic PAT (or fine-grained PAT with
+        # Contents:read + Metadata:read) for an account that has read access to
+        # the PRIVATE resight-xr/pytorch-jetson repository.
+        # Without it, `gh release download` will fail with 404 / auth error.
+        env:
+          GH_TOKEN: ${{ secrets.PYTORCH_JETSON_READ_TOKEN }}
         run: |
           uv venv --python ${{ matrix.py }} .venv
           uv pip install -p .venv --upgrade pip
           uv pip install -p .venv wheel setuptools build numpy ninja packaging
-          uv pip install -p .venv --index-url https://download.pytorch.org/whl/cu128 "torch==${{ matrix.torch_version }}"
+          if [[ "${{ matrix.wheel_tag }}" == "jp62" ]]; then
+            # Jetson wheels come from the private pytorch-jetson release, not PyPI.
+            # Private-repo download requires gh CLI + GH_TOKEN (PYTORCH_JETSON_READ_TOKEN).
+            gh release download latest \
+              --repo resight-xr/pytorch-jetson \
+              --pattern "torch-${{ matrix.torch_version }}-cp${{ matrix.py }}-cp${{ matrix.py }}-linux_aarch64.whl" \
+              --dir /tmp/jetson-torch
+            uv pip install -p .venv /tmp/jetson-torch/torch-*.whl
+          else
+            uv pip install -p .venv --index-url https://download.pytorch.org/whl/cu128 "torch==${{ matrix.torch_version }}"
+          fi
           ./.venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
 
       - name: Build wheel
         run: |
           mkdir -p dist
-          # Inject +cu128 into version so both METADATA and filename match
-          sed -i 's/^version = "\([^"]*\)"/version = "\1+cu128"/' pyproject.toml
+          # Inject the matrix wheel_tag into the version so both METADATA and
+          # filename carry the local version identifier (e.g. +cu128, +jp62).
+          # Double-quoted sed expression required so ${{ matrix.wheel_tag }} expands;
+          # wheel_tag is matrix-controlled (trusted), not user input.
+          sed -i "s/^version = \"\([^\"]*\)\"/version = \"\1+${{ matrix.wheel_tag }}\"/" pyproject.toml
           grep '^version' pyproject.toml
           ./.venv/bin/python -m build --wheel --no-isolation --outdir dist
           ls -lh dist/
 
+      # PHASE-C: Verify wheel imports correctly inside the build container.
+      # This catches CUDA linkage issues (missing symbols, wrong libcudart, etc.)
+      # that would only surface at import time, not at build time.
+      - name: Verify wheel imports
+        run: |
+          uv pip install -p .venv dist/*.whl --no-deps
+          ./.venv/bin/python -c "import fused_ssim; print('fused_ssim import OK')"
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-py${{ matrix.py }}-cu128-${{ matrix.arch }}
+          name: wheel-py${{ matrix.py }}-${{ matrix.wheel_tag }}-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
 
