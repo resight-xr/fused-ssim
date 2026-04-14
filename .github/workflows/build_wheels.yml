@@ -31,12 +31,14 @@ jobs:
             cuda_architectures: "80;86;87;89;90;100;120+PTX"
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
+            py_tag: "cp311"
           - arch: arm64
             runner: ubuntu-24.04-arm
             torch_version: "2.9.0+cu128"
             cuda_architectures: "87;89;90"
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
+            py_tag: "cp311"
           # PHASE-C: Verify nvidia/cuda:12.6.3-devel-ubuntu24.04 exists on
           # Docker Hub before this row runs in CI.  At authoring time the tag
           # was chosen to match pytorch-jetson's LSB_RELEASE=24.04 and
@@ -48,6 +50,7 @@ jobs:
             cuda_architectures: "87"
             cuda_container: "nvidia/cuda:12.6.3-devel-ubuntu24.04"
             wheel_tag: "jp62"
+            py_tag: "cp311"
 
     env:
       CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
@@ -113,7 +116,7 @@ jobs:
             # Private-repo download requires gh CLI + GH_TOKEN (PYTORCH_JETSON_READ_TOKEN).
             gh release download latest \
               --repo resight-xr/pytorch-jetson \
-              --pattern "torch-${{ matrix.torch_version }}-cp${{ matrix.py }}-cp${{ matrix.py }}-linux_aarch64.whl" \
+              --pattern "torch-${{ matrix.torch_version }}-${{ matrix.py_tag }}-${{ matrix.py_tag }}-linux_aarch64.whl" \
               --dir /tmp/jetson-torch
             uv pip install -p .venv /tmp/jetson-torch/torch-*.whl
           else
