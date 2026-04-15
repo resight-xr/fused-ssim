@@ -96,45 +96,76 @@ jobs:
           apt-get install -y --no-install-recommends \
             python3 python3-venv python3-pip python3-dev \
             git build-essential patchelf curl ca-certificates \
-            libopenblas0
+            libopenblas0 libnuma1
           rm -rf /var/lib/apt/lists/*
           ln -sf /usr/bin/python3 /usr/local/bin/python
           python3 -V
           nvcc --version
 
-      - name: Stub libs the prebuilt Jetson torch wheel links against
+      - name: Resolve Jetson torch wheel DT_NEEDED libraries
         # The dusty-nv torch 2.9.1+jp62 wheel has DT_NEEDED entries for
-        # libraries that on the Jetson are bind-mounted by
-        # nvidia-container-toolkit CDI but are NOT present in the cuda
-        # base image we use here as a build container:
+        # libraries that on a real Jetson are bind-mounted by
+        # nvidia-container-toolkit CDI. Our build container has no such
+        # bind-mount, so we have to either install the real library, add
+        # it to the loader path, or stub it. This step does all three.
         #
-        #   libcufile.so.0   (NVIDIA GPUDirect Storage)
-        #   libcudss.so.0    (NVIDIA cuDSS — sparse direct solver)
-        #   libcupti.so.12   (CUDA Profiling Tools — not always in /usr/lib)
+        # The full DT_NEEDED list (via `readelf -d` on every .so inside
+        # the wheel's torch/lib/) is:
         #
-        # Without these, `import torch` fails at load time with
-        # `ImportError: lib*.so.*: cannot open shared object file`,
-        # which kills setup.py before it can compile our extension.
+        #   In cudnn-devel image (just work):
+        #     libcudart/libcublas/libcublasLt/libcudnn/libcufft/libcurand/
+        #     libcusolver/libcusparse/libnvrtc.so.12, libgomp.so.1,
+        #     libc/libm/libstdc++/libgcc_s.
         #
-        # We don't need REAL versions of these libraries — `import torch`
-        # only triggers DT_NEEDED resolution, which is satisfied as long
-        # as the file exists with the right SONAME. Symbols are bound
-        # lazily, and torch only calls cufile/cudss/cupti from features
-        # we don't exercise during build. So we synthesize empty .so
-        # files with the right SONAMEs and put them on the loader path.
+        #   In image but not on default loader path — add to ld.so.conf.d:
+        #     libcuda.so.1   -> /usr/local/cuda/lib64/stubs/
+        #                      (NVIDIA's own driver stub; the real libcuda
+        #                       is supplied at runtime by the Jetson CDI.
+        #                       For build-only use, the stub is enough.)
+        #     libcupti.so.12 -> /usr/local/cuda/extras/CUPTI/lib64/
+        #
+        #   Installed via apt above:
+        #     libopenblas.so.0, libnuma.so.1
+        #
+        #   Not in ANY image — stub them:
+        #     libcufile.so.0  (NVIDIA GPUDirect Storage)
+        #     libcudss.so.0   (NVIDIA cuDSS — sparse direct solver)
+        #
+        #   Internal to the wheel (resolved via RPATH):
+        #     libc10*.so, libtorch*.so, libshm.so
+        #
+        # Stubs work because `import torch` only triggers DT_NEEDED load,
+        # not symbol resolution — binding is lazy, and setup.py never
+        # calls into cufile/cudss during the build.
         if: matrix.wheel_tag == 'jp62'
         run: |
           set -eux
+
+          # 1. Real libs from the CUDA toolkit, on ldconfig path.
+          {
+            echo /usr/local/cuda/lib64/stubs
+            echo /usr/local/cuda/extras/CUPTI/lib64
+          } > /etc/ld.so.conf.d/cuda-build.conf
+          test -f /usr/local/cuda/lib64/stubs/libcuda.so
+          test -f /usr/local/cuda/extras/CUPTI/lib64/libcupti.so
+          # libcuda.so ships as a stub without the .1 SONAME suffix that
+          # the torch wheel wants. Create the symlink so the loader finds
+          # it as libcuda.so.1.
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          ln -sf /usr/local/cuda/extras/CUPTI/lib64/libcupti.so /usr/local/cuda/extras/CUPTI/lib64/libcupti.so.12
+
+          # 2. Empty SONAME stubs for cufile + cudss.
           mkdir -p /usr/local/lib/torch-stubs
           printf '%s\n' 'void __torch_stub_noop(void) {}' > /tmp/stub.c
-          for soname in libcufile.so.0 libcudss.so.0 libcupti.so.12; do
+          for soname in libcufile.so.0 libcudss.so.0; do
             gcc -shared -fPIC -Wl,-soname,"$soname" \
               -o "/usr/local/lib/torch-stubs/$soname" /tmp/stub.c
           done
           rm /tmp/stub.c
           echo /usr/local/lib/torch-stubs > /etc/ld.so.conf.d/torch-stubs.conf
+
           ldconfig
-          ldconfig -p | grep -E 'libcufile|libcudss|libcupti' || true
+          ldconfig -p | grep -E 'libcuda\.so|libcupti|libcufile|libcudss|libnuma|libopenblas' || true
 
       # Install the GitHub CLI so the jp62 row can download the private
       # pytorch-jetson wheel via `gh release download`.  We install it
@@ -199,6 +230,31 @@ jobs:
           else
             uv pip install -p .venv --index-url ${{ matrix.torch_index_url }} "torch==${{ matrix.torch_version }}"
           fi
+
+          # Diagnostic: before `import torch`, run ldd against the
+          # compiled torch core .so to find every unresolved DT_NEEDED
+          # in a single pass. Previously we learned about missing libs
+          # one at a time (cudnn -> openblas -> numa -> ...), each costing
+          # a full CI round. This failure mode is specific to the jp62 row
+          # (Jetson wheel on a non-Jetson container); on the cu128 rows
+          # everything resolves from the standard image.
+          site=$(./.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+          core_so=$(ls "${site}"/torch/_C.cpython-*.so | head -1)
+          echo "Running ldd on: ${core_so}"
+          ldd "${core_so}" || true
+          missing=$(ldd "${core_so}" 2>&1 | awk '/not found/{print $1}' || true)
+          if [[ -n "${missing}" ]]; then
+            echo "FAIL: torch wheel has unresolved DT_NEEDED entries:"
+            echo "${missing}"
+            echo ""
+            echo "For each missing lib, either:"
+            echo "  - install it via apt in the 'Install OS deps' step, OR"
+            echo "  - add its containing dir to /etc/ld.so.conf.d/, OR"
+            echo "  - add an empty SONAME stub under /usr/local/lib/torch-stubs/"
+            echo "See the 'Resolve Jetson torch wheel DT_NEEDED libraries' step."
+            exit 1
+          fi
+
           ./.venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
 
       - name: Build wheel
