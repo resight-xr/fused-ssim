@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        py: ["3.11"]
+        py: ["3.10"]
         arch:
           - amd64
           - arm64
@@ -31,7 +31,7 @@ jobs:
             cuda_architectures: "80;86;87;89;90;100;120+PTX"
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
-            py_tag: "cp311"
+            py_tag: "cp310"
             torch_index_url: "https://download.pytorch.org/whl/cu128"
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -39,20 +39,18 @@ jobs:
             cuda_architectures: "87;89;90"
             cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
             wheel_tag: "cu128"
-            py_tag: "cp311"
+            py_tag: "cp310"
             torch_index_url: "https://download.pytorch.org/whl/cu128"
-          # PHASE-C: Verify nvidia/cuda:12.6.3-devel-ubuntu24.04 exists on
-          # Docker Hub before this row runs in CI.  At authoring time the tag
-          # was chosen to match pytorch-jetson's LSB_RELEASE=24.04 and
-          # CUDA 12.6 build environment.  If the exact tag is absent, pick
-          # the closest available 12.6.x-devel-ubuntu24.04 tag.
+          # Ubuntu 22.04 to match JetPack 6.2's native rootfs — building
+          # against a newer glibc/libstdc++ risks symbol-version mismatches
+          # when the wheel is loaded on the Jetson at runtime.
           - arch: arm64-jetson
             runner: ubuntu-24.04-arm
             torch_version: "2.9.1+jp62"
             cuda_architectures: "87"
-            cuda_container: "nvidia/cuda:12.6.3-devel-ubuntu24.04"
+            cuda_container: "nvidia/cuda:12.6.3-devel-ubuntu22.04"
             wheel_tag: "jp62"
-            py_tag: "cp311"
+            py_tag: "cp310"
 
     env:
       CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
