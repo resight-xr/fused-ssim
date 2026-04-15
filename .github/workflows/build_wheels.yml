@@ -44,7 +44,15 @@ jobs:
           # Ubuntu 22.04 to match JetPack 6.2's native rootfs — building
           # against a newer glibc/libstdc++ risks symbol-version mismatches
           # when the wheel is loaded on the Jetson at runtime.
+          #
+          # `py` is set explicitly here because this include entry introduces
+          # a new `arch` value (arm64-jetson) that does NOT match any
+          # combination produced by the top-level matrix axes (py × arch).
+          # GitHub Actions treats such entries as fresh rows and does NOT
+          # inherit the top-level `py: ["3.10"]` — ${{ matrix.py }} would
+          # expand to an empty string, breaking `uv venv --python <blank>`.
           - arch: arm64-jetson
+            py: "3.10"
             runner: ubuntu-24.04-arm
             torch_version: "2.9.1+jp62"
             cuda_architectures: "87"
