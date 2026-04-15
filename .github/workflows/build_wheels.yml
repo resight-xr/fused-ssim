@@ -56,6 +56,14 @@ jobs:
           # against a newer glibc/libstdc++ risks symbol-version mismatches
           # when the wheel is loaded on the Jetson at runtime.
           #
+          # cudnn-devel (not plain devel): the prebuilt Jetson torch wheel
+          # dynamically links against libcudnn.so.9 at import time. On the
+          # Jetson itself libcudnn is supplied via nvidia-container-toolkit
+          # CDI bind-mount, but the build container has no such bind-mount,
+          # so cuDNN must be present in the image. Observed as:
+          #   ImportError: libcudnn.so.9: cannot open shared object file
+          # during the `import torch` smoke test.
+          #
           # `py` is set explicitly here because this include entry introduces
           # a new `arch` value (arm64-jetson) that does NOT match any
           # combination produced by the top-level matrix axes (py × arch).
@@ -67,7 +75,7 @@ jobs:
             runner: ubuntu-24.04-arm
             torch_version: "2.9.1+jp62"
             cuda_architectures: "87"
-            cuda_container: "nvidia/cuda:12.6.3-devel-ubuntu22.04"
+            cuda_container: "nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04"
             wheel_tag: "jp62"
             py_tag: "cp310"
 
@@ -87,11 +95,46 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             python3 python3-venv python3-pip python3-dev \
-            git build-essential patchelf curl ca-certificates
+            git build-essential patchelf curl ca-certificates \
+            libopenblas0
           rm -rf /var/lib/apt/lists/*
           ln -sf /usr/bin/python3 /usr/local/bin/python
           python3 -V
           nvcc --version
+
+      - name: Stub libs the prebuilt Jetson torch wheel links against
+        # The dusty-nv torch 2.9.1+jp62 wheel has DT_NEEDED entries for
+        # libraries that on the Jetson are bind-mounted by
+        # nvidia-container-toolkit CDI but are NOT present in the cuda
+        # base image we use here as a build container:
+        #
+        #   libcufile.so.0   (NVIDIA GPUDirect Storage)
+        #   libcudss.so.0    (NVIDIA cuDSS — sparse direct solver)
+        #   libcupti.so.12   (CUDA Profiling Tools — not always in /usr/lib)
+        #
+        # Without these, `import torch` fails at load time with
+        # `ImportError: lib*.so.*: cannot open shared object file`,
+        # which kills setup.py before it can compile our extension.
+        #
+        # We don't need REAL versions of these libraries — `import torch`
+        # only triggers DT_NEEDED resolution, which is satisfied as long
+        # as the file exists with the right SONAME. Symbols are bound
+        # lazily, and torch only calls cufile/cudss/cupti from features
+        # we don't exercise during build. So we synthesize empty .so
+        # files with the right SONAMEs and put them on the loader path.
+        if: matrix.wheel_tag == 'jp62'
+        run: |
+          set -eux
+          mkdir -p /usr/local/lib/torch-stubs
+          printf '%s\n' 'void __torch_stub_noop(void) {}' > /tmp/stub.c
+          for soname in libcufile.so.0 libcudss.so.0 libcupti.so.12; do
+            gcc -shared -fPIC -Wl,-soname,"$soname" \
+              -o "/usr/local/lib/torch-stubs/$soname" /tmp/stub.c
+          done
+          rm /tmp/stub.c
+          echo /usr/local/lib/torch-stubs > /etc/ld.so.conf.d/torch-stubs.conf
+          ldconfig
+          ldconfig -p | grep -E 'libcufile|libcudss|libcupti' || true
 
       # Install the GitHub CLI so the jp62 row can download the private
       # pytorch-jetson wheel via `gh release download`.  We install it
