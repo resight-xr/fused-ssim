@@ -109,43 +109,53 @@ jobs:
         # The dusty-nv torch 2.9.1+jp62 wheel has DT_NEEDED entries for
         # libraries that on a real Jetson are bind-mounted by
         # nvidia-container-toolkit CDI. Our build container has no such
-        # bind-mount, so we have to either install the real library, add
-        # it to the loader path, or stub it. This step does all three.
+        # bind-mount, so each one has to be resolvable at load time AND
+        # at symbol-lookup time (Python opens torch with RTLD_NOW-ish
+        # semantics and the linker walks every referenced symbol).
         #
         # The full DT_NEEDED list (via `readelf -d` on every .so inside
-        # the wheel's torch/lib/) is:
+        # the wheel's torch/lib/) resolves like this:
         #
-        #   In cudnn-devel image (just work):
+        #   Already in cudnn-devel image, on torch's DT_RUNPATH:
         #     libcudart/libcublas/libcublasLt/libcudnn/libcufft/libcurand/
-        #     libcusolver/libcusparse/libnvrtc.so.12, libgomp.so.1,
-        #     libc/libm/libstdc++/libgcc_s.
+        #     libcusolver/libcusparse/libnvrtc.so.12 (in /usr/local/cuda/
+        #     targets/sbsa-linux/lib), libcufile.so.0 (same dir — was NOT
+        #     always stubbed as previously assumed!), libcupti.so.12
+        #     (same dir), libgomp.so.1, libc/libm/libstdc++/libgcc_s.
         #
-        #   apt install here (jp62 only — cu128 rows don't need them and
-        #   would run out of disk if we added them to "Install OS deps"):
+        #   apt install (jp62-only — cu128 rows run out of disk otherwise):
         #     libopenblas.so.0  -> libopenblas0
         #     libnuma.so.1      -> libnuma1
         #
         #   In image but not on default loader path — add to ld.so.conf.d:
         #     libcuda.so.1      -> /usr/local/cuda/lib64/stubs/
-        #                          (NVIDIA's driver stub; real libcuda
-        #                           is supplied at runtime by Jetson CDI;
-        #                           for build-only use, stub is enough.)
+        #                          (NVIDIA's driver stub; real libcuda is
+        #                           supplied at runtime by Jetson CDI; for
+        #                           build-only use, the stub is enough.)
         #
-        #   Not in ANY image — stub them:
-        #     libcufile.so.0    (NVIDIA GPUDirect Storage)
-        #     libcudss.so.0     (NVIDIA cuDSS — sparse direct solver)
-        #     libcupti.so.12    (CUDA Profiling Tools Interface — lives in
-        #                        a non-standard path that varies by image
-        #                        variant; just stub it, torch doesn't call
-        #                        into it during build.)
+        #   Not in any image — download real library from NVIDIA:
+        #     libcudss.so.0  (NVIDIA cuDSS sparse direct solver)
+        #
+        #   I tried an empty SONAME stub for cuDSS and it DIDN'T WORK —
+        #   libtorch_cuda.so has a non-lazy reference to cudssMatrixCreateCsr
+        #   which fails with `undefined symbol` at `import torch`. So we
+        #   need the real library. cuDSS is not in the cuda-keyring apt
+        #   repo; NVIDIA ships it as a standalone tarball under
+        #   https://developer.download.nvidia.com/compute/cudss/redist/.
+        #   We download the linux-sbsa cuda12 variant (~45 MB compressed)
+        #   and drop libcudss.so.0 + libcudss.so.0.X.Y on the ldconfig path.
+        #   Version pinned in CUDSS_VERSION below — bump when upstream torch
+        #   on pypi.jetson-ai-lab.io starts linking against a newer cuDSS.
         #
         #   Internal to the wheel (resolved via RPATH):
         #     libc10*.so, libtorch*.so, libshm.so
-        #
-        # Stubs work because `import torch` only triggers DT_NEEDED load,
-        # not symbol resolution — binding is lazy, and setup.py never
-        # calls into cufile/cudss/cupti during the build.
         if: matrix.wheel_tag == 'jp62'
+        env:
+          # cuDSS version. Any 0.x version that exports the cudssMatrix*
+          # API should work. 0.4.0.2 is the version nvidia-cuda-cu12
+          # wheels on PyPI ship with as of this writing, which is the
+          # same ABI line torch 2.9.x was built against.
+          CUDSS_VERSION: "0.4.0.2"
         run: |
           set -eux
 
@@ -157,22 +167,22 @@ jobs:
           # 2. Driver stub from the CUDA toolkit, on ldconfig path.
           echo /usr/local/cuda/lib64/stubs > /etc/ld.so.conf.d/cuda-build.conf
           test -f /usr/local/cuda/lib64/stubs/libcuda.so
-          # libcuda.so ships as a stub without the .1 SONAME suffix the
-          # torch wheel wants. Create the symlink.
+          # libcuda.so ships without the .1 SONAME suffix the torch wheel
+          # wants. Symlink it.
           ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 
-          # 3. Empty SONAME stubs for everything else not in the image.
-          mkdir -p /usr/local/lib/torch-stubs
-          printf '%s\n' 'void __torch_stub_noop(void) {}' > /tmp/stub.c
-          for soname in libcufile.so.0 libcudss.so.0 libcupti.so.12; do
-            gcc -shared -fPIC -Wl,-soname,"$soname" \
-              -o "/usr/local/lib/torch-stubs/$soname" /tmp/stub.c
-          done
-          rm /tmp/stub.c
-          echo /usr/local/lib/torch-stubs > /etc/ld.so.conf.d/torch-stubs.conf
+          # 3. Real cuDSS from NVIDIA.
+          mkdir -p /opt/cudss
+          curl --fail --location --retry 3 --retry-delay 5 \
+            -o /tmp/cudss.tar.xz \
+            "https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-sbsa/libcudss-linux-sbsa-${CUDSS_VERSION}_cuda12-archive.tar.xz"
+          tar -xJf /tmp/cudss.tar.xz -C /opt/cudss --strip-components=1
+          rm /tmp/cudss.tar.xz
+          ls -l /opt/cudss/lib/libcudss.so*
+          echo /opt/cudss/lib > /etc/ld.so.conf.d/cudss.conf
 
           ldconfig
-          ldconfig -p | grep -E 'libcuda\.so|libcupti|libcufile|libcudss|libnuma|libopenblas' || true
+          ldconfig -p | grep -E 'libcuda\.so|libcudss|libnuma|libopenblas' || true
 
       # Install the GitHub CLI so the jp62 row can download the private
       # pytorch-jetson wheel via `gh release download`.  We install it
