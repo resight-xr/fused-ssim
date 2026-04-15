@@ -91,12 +91,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install OS deps
+        # Keep this step minimal and identical across matrix rows. Anything
+        # jp62-specific lives in the next step — the cu128 rows pull ~7 GB
+        # of nvidia-cuda-cu12 wheels from PyPI and are already near the
+        # runner disk limit, so every extra apt package hurts them.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
             python3 python3-venv python3-pip python3-dev \
-            git build-essential patchelf curl ca-certificates \
-            libopenblas0 libnuma1
+            git build-essential patchelf curl ca-certificates
           rm -rf /var/lib/apt/lists/*
           ln -sf /usr/bin/python3 /usr/local/bin/python
           python3 -V
@@ -117,47 +120,51 @@ jobs:
         #     libcusolver/libcusparse/libnvrtc.so.12, libgomp.so.1,
         #     libc/libm/libstdc++/libgcc_s.
         #
-        #   In image but not on default loader path — add to ld.so.conf.d:
-        #     libcuda.so.1   -> /usr/local/cuda/lib64/stubs/
-        #                      (NVIDIA's own driver stub; the real libcuda
-        #                       is supplied at runtime by the Jetson CDI.
-        #                       For build-only use, the stub is enough.)
-        #     libcupti.so.12 -> /usr/local/cuda/extras/CUPTI/lib64/
+        #   apt install here (jp62 only — cu128 rows don't need them and
+        #   would run out of disk if we added them to "Install OS deps"):
+        #     libopenblas.so.0  -> libopenblas0
+        #     libnuma.so.1      -> libnuma1
         #
-        #   Installed via apt above:
-        #     libopenblas.so.0, libnuma.so.1
+        #   In image but not on default loader path — add to ld.so.conf.d:
+        #     libcuda.so.1      -> /usr/local/cuda/lib64/stubs/
+        #                          (NVIDIA's driver stub; real libcuda
+        #                           is supplied at runtime by Jetson CDI;
+        #                           for build-only use, stub is enough.)
         #
         #   Not in ANY image — stub them:
-        #     libcufile.so.0  (NVIDIA GPUDirect Storage)
-        #     libcudss.so.0   (NVIDIA cuDSS — sparse direct solver)
+        #     libcufile.so.0    (NVIDIA GPUDirect Storage)
+        #     libcudss.so.0     (NVIDIA cuDSS — sparse direct solver)
+        #     libcupti.so.12    (CUDA Profiling Tools Interface — lives in
+        #                        a non-standard path that varies by image
+        #                        variant; just stub it, torch doesn't call
+        #                        into it during build.)
         #
         #   Internal to the wheel (resolved via RPATH):
         #     libc10*.so, libtorch*.so, libshm.so
         #
         # Stubs work because `import torch` only triggers DT_NEEDED load,
         # not symbol resolution — binding is lazy, and setup.py never
-        # calls into cufile/cudss during the build.
+        # calls into cufile/cudss/cupti during the build.
         if: matrix.wheel_tag == 'jp62'
         run: |
           set -eux
 
-          # 1. Real libs from the CUDA toolkit, on ldconfig path.
-          {
-            echo /usr/local/cuda/lib64/stubs
-            echo /usr/local/cuda/extras/CUPTI/lib64
-          } > /etc/ld.so.conf.d/cuda-build.conf
-          test -f /usr/local/cuda/lib64/stubs/libcuda.so
-          test -f /usr/local/cuda/extras/CUPTI/lib64/libcupti.so
-          # libcuda.so ships as a stub without the .1 SONAME suffix that
-          # the torch wheel wants. Create the symlink so the loader finds
-          # it as libcuda.so.1.
-          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-          ln -sf /usr/local/cuda/extras/CUPTI/lib64/libcupti.so /usr/local/cuda/extras/CUPTI/lib64/libcupti.so.12
+          # 1. jp62-only apt packages.
+          apt-get update
+          apt-get install -y --no-install-recommends libopenblas0 libnuma1
+          rm -rf /var/lib/apt/lists/*
 
-          # 2. Empty SONAME stubs for cufile + cudss.
+          # 2. Driver stub from the CUDA toolkit, on ldconfig path.
+          echo /usr/local/cuda/lib64/stubs > /etc/ld.so.conf.d/cuda-build.conf
+          test -f /usr/local/cuda/lib64/stubs/libcuda.so
+          # libcuda.so ships as a stub without the .1 SONAME suffix the
+          # torch wheel wants. Create the symlink.
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+          # 3. Empty SONAME stubs for everything else not in the image.
           mkdir -p /usr/local/lib/torch-stubs
           printf '%s\n' 'void __torch_stub_noop(void) {}' > /tmp/stub.c
-          for soname in libcufile.so.0 libcudss.so.0; do
+          for soname in libcufile.so.0 libcudss.so.0 libcupti.so.12; do
             gcc -shared -fPIC -Wl,-soname,"$soname" \
               -o "/usr/local/lib/torch-stubs/$soname" /tmp/stub.c
           done
