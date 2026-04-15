@@ -14,6 +14,17 @@ jobs:
     name: Build wheel (py${{ matrix.py }}-${{ matrix.wheel_tag }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
+    # GH Actions defaults `run:` steps to `sh -e` inside containers. The
+    # jp62/cu128 branching in "Create venv and install deps" uses `[[ ]]`
+    # which is a bash-ism; under sh it silently fails with
+    #   sh: [[: not found
+    # and the if-branch falls through to the else-branch, leading to a
+    # broken `uv pip install --index-url <empty>` call. Forcing bash as
+    # the default shell for this job's run: steps fixes that.
+    defaults:
+      run:
+        shell: bash
+
     container:
       image: ${{ matrix.cuda_container }}
 
