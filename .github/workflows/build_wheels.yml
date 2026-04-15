@@ -11,16 +11,27 @@ permissions:
 
 jobs:
   build:
-    name: Build wheel (py${{ matrix.py }}-cu128-${{ matrix.arch }})
+    name: Build wheel (py${{ matrix.py }}-${{ matrix.wheel_tag }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
+    # GH Actions defaults `run:` steps to `sh -e` inside containers. The
+    # jp62/cu128 branching in "Create venv and install deps" uses `[[ ]]`
+    # which is a bash-ism; under sh it silently fails with
+    #   sh: [[: not found
+    # and the if-branch falls through to the else-branch, leading to a
+    # broken `uv pip install --index-url <empty>` call. Forcing bash as
+    # the default shell for this job's run: steps fixes that.
+    defaults:
+      run:
+        shell: bash
+
     container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+      image: ${{ matrix.cuda_container }}
 
     strategy:
       fail-fast: false
       matrix:
-        py: ["3.11"]
+        py: ["3.10"]
         arch:
           - amd64
           - arm64
@@ -29,10 +40,44 @@ jobs:
             runner: ubuntu-24.04
             torch_version: "2.8.0+cu128"
             cuda_architectures: "80;86;87;89;90;100;120+PTX"
+            cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
+            wheel_tag: "cu128"
+            py_tag: "cp310"
+            torch_index_url: "https://download.pytorch.org/whl/cu128"
           - arch: arm64
             runner: ubuntu-24.04-arm
             torch_version: "2.9.0+cu128"
             cuda_architectures: "87;89;90"
+            cuda_container: "nvidia/cuda:12.8.0-devel-ubuntu22.04"
+            wheel_tag: "cu128"
+            py_tag: "cp310"
+            torch_index_url: "https://download.pytorch.org/whl/cu128"
+          # Ubuntu 22.04 to match JetPack 6.2's native rootfs — building
+          # against a newer glibc/libstdc++ risks symbol-version mismatches
+          # when the wheel is loaded on the Jetson at runtime.
+          #
+          # cudnn-devel (not plain devel): the prebuilt Jetson torch wheel
+          # dynamically links against libcudnn.so.9 at import time. On the
+          # Jetson itself libcudnn is supplied via nvidia-container-toolkit
+          # CDI bind-mount, but the build container has no such bind-mount,
+          # so cuDNN must be present in the image. Observed as:
+          #   ImportError: libcudnn.so.9: cannot open shared object file
+          # during the `import torch` smoke test.
+          #
+          # `py` is set explicitly here because this include entry introduces
+          # a new `arch` value (arm64-jetson) that does NOT match any
+          # combination produced by the top-level matrix axes (py × arch).
+          # GitHub Actions treats such entries as fresh rows and does NOT
+          # inherit the top-level `py: ["3.10"]` — ${{ matrix.py }} would
+          # expand to an empty string, breaking `uv venv --python <blank>`.
+          - arch: arm64-jetson
+            py: "3.10"
+            runner: ubuntu-24.04-arm
+            torch_version: "2.9.1+jp62"
+            cuda_architectures: "87"
+            cuda_container: "nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04"
+            wheel_tag: "jp62"
+            py_tag: "cp310"
 
     env:
       CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
@@ -46,6 +91,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install OS deps
+        # Keep this step minimal and identical across matrix rows. Anything
+        # jp62-specific lives in the next step — the cu128 rows pull ~7 GB
+        # of nvidia-cuda-cu12 wheels from PyPI and are already near the
+        # runner disk limit, so every extra apt package hurts them.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -56,6 +105,100 @@ jobs:
           python3 -V
           nvcc --version
 
+      - name: Resolve Jetson torch wheel DT_NEEDED libraries
+        # The dusty-nv torch 2.9.1+jp62 wheel has DT_NEEDED entries for
+        # libraries that on a real Jetson are bind-mounted by
+        # nvidia-container-toolkit CDI. Our build container has no such
+        # bind-mount, so each one has to be resolvable at load time AND
+        # at symbol-lookup time (Python opens torch with RTLD_NOW-ish
+        # semantics and the linker walks every referenced symbol).
+        #
+        # The full DT_NEEDED list (via `readelf -d` on every .so inside
+        # the wheel's torch/lib/) resolves like this:
+        #
+        #   Already in cudnn-devel image, on torch's DT_RUNPATH:
+        #     libcudart/libcublas/libcublasLt/libcudnn/libcufft/libcurand/
+        #     libcusolver/libcusparse/libnvrtc.so.12 (in /usr/local/cuda/
+        #     targets/sbsa-linux/lib), libcufile.so.0 (same dir — was NOT
+        #     always stubbed as previously assumed!), libcupti.so.12
+        #     (same dir), libgomp.so.1, libc/libm/libstdc++/libgcc_s.
+        #
+        #   apt install (jp62-only — cu128 rows run out of disk otherwise):
+        #     libopenblas.so.0  -> libopenblas0
+        #     libnuma.so.1      -> libnuma1
+        #
+        #   In image but not on default loader path — add to ld.so.conf.d:
+        #     libcuda.so.1      -> /usr/local/cuda/lib64/stubs/
+        #                          (NVIDIA's driver stub; real libcuda is
+        #                           supplied at runtime by Jetson CDI; for
+        #                           build-only use, the stub is enough.)
+        #
+        #   Not in any image — download real library from NVIDIA:
+        #     libcudss.so.0  (NVIDIA cuDSS sparse direct solver)
+        #
+        #   I tried an empty SONAME stub for cuDSS and it DIDN'T WORK —
+        #   libtorch_cuda.so has a non-lazy reference to cudssMatrixCreateCsr
+        #   which fails with `undefined symbol` at `import torch`. So we
+        #   need the real library. cuDSS is not in the cuda-keyring apt
+        #   repo; NVIDIA ships it as a standalone tarball under
+        #   https://developer.download.nvidia.com/compute/cudss/redist/.
+        #   We download the linux-sbsa cuda12 variant (~45 MB compressed)
+        #   and drop libcudss.so.0 + libcudss.so.0.X.Y on the ldconfig path.
+        #   Version pinned in CUDSS_VERSION below — bump when upstream torch
+        #   on pypi.jetson-ai-lab.io starts linking against a newer cuDSS.
+        #
+        #   Internal to the wheel (resolved via RPATH):
+        #     libc10*.so, libtorch*.so, libshm.so
+        if: matrix.wheel_tag == 'jp62'
+        env:
+          # cuDSS version. Any 0.x version that exports the cudssMatrix*
+          # API should work. 0.4.0.2 is the version nvidia-cuda-cu12
+          # wheels on PyPI ship with as of this writing, which is the
+          # same ABI line torch 2.9.x was built against.
+          CUDSS_VERSION: "0.4.0.2"
+        run: |
+          set -eux
+
+          # 1. jp62-only apt packages.
+          apt-get update
+          apt-get install -y --no-install-recommends libopenblas0 libnuma1
+          rm -rf /var/lib/apt/lists/*
+
+          # 2. Driver stub from the CUDA toolkit, on ldconfig path.
+          echo /usr/local/cuda/lib64/stubs > /etc/ld.so.conf.d/cuda-build.conf
+          test -f /usr/local/cuda/lib64/stubs/libcuda.so
+          # libcuda.so ships without the .1 SONAME suffix the torch wheel
+          # wants. Symlink it.
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+          # 3. Real cuDSS from NVIDIA.
+          mkdir -p /opt/cudss
+          curl --fail --location --retry 3 --retry-delay 5 \
+            -o /tmp/cudss.tar.xz \
+            "https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-sbsa/libcudss-linux-sbsa-${CUDSS_VERSION}_cuda12-archive.tar.xz"
+          tar -xJf /tmp/cudss.tar.xz -C /opt/cudss --strip-components=1
+          rm /tmp/cudss.tar.xz
+          ls -l /opt/cudss/lib/libcudss.so*
+          echo /opt/cudss/lib > /etc/ld.so.conf.d/cudss.conf
+
+          ldconfig
+          ldconfig -p | grep -E 'libcuda\.so|libcudss|libnuma|libopenblas' || true
+
+      # Install the GitHub CLI so the jp62 row can download the private
+      # pytorch-jetson wheel via `gh release download`.  We install it
+      # universally (it is a small binary) rather than conditionally to
+      # avoid extra YAML complexity; on the cu128 rows it is simply unused.
+      - name: Install gh CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+            https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
+          rm -rf /var/lib/apt/lists/*
+
       - name: Install uv
         run: |
           python3 -m pip install -U uv
@@ -65,26 +208,98 @@ jobs:
         run: uv python install ${{ matrix.py }}
 
       - name: Create venv and install deps
+        # PHASE-C: The jp62 branch requires the secret PYTORCH_JETSON_READ_TOKEN
+        # to be created in the fused-ssim repo settings
+        # (Settings → Secrets and variables → Actions → New repository secret).
+        # The secret must hold a Classic PAT (or fine-grained PAT with
+        # Contents:read + Metadata:read) for an account that has read access to
+        # the PRIVATE resight-xr/pytorch-jetson repository.
+        # Without it, `gh release download` will fail with 404 / auth error.
+        # GH_TOKEN resolves to an empty string on cu128 rows (the secret is only
+        # needed for jp62); this is intentional and harmless because `gh` is
+        # only invoked inside the `if [[ wheel_tag == jp62 ]]` branch below.
+        env:
+          GH_TOKEN: ${{ secrets.PYTORCH_JETSON_READ_TOKEN }}
         run: |
           uv venv --python ${{ matrix.py }} .venv
           uv pip install -p .venv --upgrade pip
           uv pip install -p .venv wheel setuptools build numpy ninja packaging
-          uv pip install -p .venv --index-url https://download.pytorch.org/whl/cu128 "torch==${{ matrix.torch_version }}"
+          if [[ "${{ matrix.wheel_tag }}" == "jp62" ]]; then
+            # Jetson wheels come from the private pytorch-jetson release, not PyPI.
+            # Private-repo download requires gh CLI + GH_TOKEN (PYTORCH_JETSON_READ_TOKEN).
+            # PHASE-C: `latest` is a mutable release tag — if the torch version
+            # published under `latest` diverges from matrix.torch_version, the
+            # --pattern below will match nothing and the zero-match guard below
+            # will surface the mismatch.  Once torch versions stabilise, pin
+            # this to a versioned release tag (e.g. `v2.9.1-jp62`) instead.
+            gh release download latest \
+              --repo resight-xr/pytorch-jetson \
+              --pattern "torch-${{ matrix.torch_version }}-${{ matrix.py_tag }}-${{ matrix.py_tag }}-linux_aarch64.whl" \
+              --dir /tmp/jetson-torch
+            # Guard: if the pattern matched nothing, gh exits 0 silently — catch that here.
+            ls /tmp/jetson-torch/torch-*.whl >/dev/null 2>&1 || {
+              echo "ERROR: gh release download matched no assets for pattern torch-${{ matrix.torch_version }}-${{ matrix.py_tag }}-${{ matrix.py_tag }}-linux_aarch64.whl"
+              echo "Listing /tmp/jetson-torch:"
+              ls -la /tmp/jetson-torch/ 2>&1 || echo "(directory does not exist)"
+              exit 1
+            }
+            uv pip install -p .venv /tmp/jetson-torch/torch-*.whl
+          else
+            uv pip install -p .venv --index-url ${{ matrix.torch_index_url }} "torch==${{ matrix.torch_version }}"
+          fi
+
+          # Diagnostic: before `import torch`, run ldd against the
+          # compiled torch core .so to find every unresolved DT_NEEDED
+          # in a single pass. Previously we learned about missing libs
+          # one at a time (cudnn -> openblas -> numa -> ...), each costing
+          # a full CI round. This failure mode is specific to the jp62 row
+          # (Jetson wheel on a non-Jetson container); on the cu128 rows
+          # everything resolves from the standard image.
+          site=$(./.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+          core_so=$(ls "${site}"/torch/_C.cpython-*.so | head -1)
+          echo "Running ldd on: ${core_so}"
+          ldd "${core_so}" || true
+          missing=$(ldd "${core_so}" 2>&1 | awk '/not found/{print $1}' || true)
+          if [[ -n "${missing}" ]]; then
+            echo "FAIL: torch wheel has unresolved DT_NEEDED entries:"
+            echo "${missing}"
+            echo ""
+            echo "For each missing lib, either:"
+            echo "  - install it via apt in the 'Install OS deps' step, OR"
+            echo "  - add its containing dir to /etc/ld.so.conf.d/, OR"
+            echo "  - add an empty SONAME stub under /usr/local/lib/torch-stubs/"
+            echo "See the 'Resolve Jetson torch wheel DT_NEEDED libraries' step."
+            exit 1
+          fi
+
           ./.venv/bin/python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda}')"
 
       - name: Build wheel
         run: |
           mkdir -p dist
-          # Inject +cu128 into version so both METADATA and filename match
-          sed -i 's/^version = "\([^"]*\)"/version = "\1+cu128"/' pyproject.toml
+          # Inject the matrix wheel_tag into the version so both METADATA and
+          # filename carry the local version identifier (e.g. +cu128, +jp62).
+          # Double-quoted sed expression required so ${{ matrix.wheel_tag }} expands;
+          # wheel_tag is matrix-controlled (trusted), not user input.
+          sed -i "s/^version = \"\([^\"]*\)\"/version = \"\1+${{ matrix.wheel_tag }}\"/" pyproject.toml
           grep '^version' pyproject.toml
           ./.venv/bin/python -m build --wheel --no-isolation --outdir dist
           ls -lh dist/
 
+      # PHASE-C: Watch this step on first CI run — it surfaces CUDA linkage
+      # failures (missing symbols, wrong libcudart) that only appear at import.
+      - name: Verify wheel imports
+        run: |
+          uv pip install -p .venv dist/*.whl --no-deps
+          ./.venv/bin/python -c "import fused_ssim; print('fused_ssim import OK')"
+
+      # Artifact names are unique via the (wheel_tag, arch) combination.
+      # `arch: arm64-jetson` is load-bearing here — it distinguishes the jp62
+      # artifact from the plain arm64/cu128 artifact, not just a cosmetic label.
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-py${{ matrix.py }}-cu128-${{ matrix.arch }}
+          name: wheel-py${{ matrix.py }}-${{ matrix.wheel_tag }}-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
 
