@@ -1,3 +1,19 @@
+## Resight fork — why this repo exists
+
+This is a fork maintained by [Resight](https://github.com/resight-xr) for one purpose: to build **aarch64 + NVIDIA Jetson (JetPack 6.2, CUDA 12.6, sm_87 Orin)** CUDA wheels that upstream doesn't publish.
+
+- Upstream source is unchanged — we only add a CI workflow.
+- Wheel artifacts: [GitHub Releases](../../releases).
+- Consumed by [resight-lab](https://github.com/resight-xr/resight-lab) via `vendor/wheels/SOURCES.txt` + `just update-wheels`.
+- Rationale: [`why-fork-jetson-wheels.md`](https://github.com/resight-xr/resight-lab/blob/main/docs/explanation/why-fork-jetson-wheels.md).
+- See also: [`AGENTS.md`](./AGENTS.md), [`CLAUDE.md`](./CLAUDE.md), [`CHANGELOG.md`](./CHANGELOG.md).
+
+Sibling repo with the same pattern: [resight-xr/nvdiffrast](https://github.com/resight-xr/nvdiffrast).
+
+The rest of this README is the upstream documentation.
+
+---
+
 # Fully Fused Differentiable SSIM
 
 This repository contains an efficient fully-fused implementation of [SSIM](https://en.wikipedia.org/wiki/Structural_similarity_index_measure) which is differentiable in nature. There are several factors that contribute to an efficient implementation:
